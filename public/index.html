@@ -781,6 +781,10 @@
         status: s.status 
       });
       
+      // 🔧 AUTO-JOIN: Unirse automáticamente a la room para recibir eventos (QR, ready, etc.)
+      socket.emit('join', id);
+      console.log(`Auto-joined room: ${id}`);
+      
       updateStats();
     }
 
@@ -818,13 +822,19 @@
 
     // Socket events
     socket.on('sessions', (arr) => {
-      arr.forEach(s => renderCard(s));
+      arr.forEach(s => {
+        renderCard(s);
+        // Ya no es necesario el join aquí porque renderCard lo hace automáticamente
+      });
     });
 
     socket.on('qr', ({ id, qr }) => {
-      if (!sessions.has(id)) renderCard({ id, status: 'qr' });
+      if (!sessions.has(id)) {
+        renderCard({ id, status: 'qr' });
+      }
       setStatus(id, 'qr');
       setQR(id, qr);
+      console.log(`QR received for session: ${id}`);
       showToast(`QR generado para ${id}`, 'info');
     });
 
@@ -882,6 +892,7 @@
         
         if (!sessions.has(id)) {
           renderCard({ id, status: r.status || 'initializing' });
+          // El auto-join ya se hace dentro de renderCard
           document.getElementById('sid').value = '';
           showToast(`Sesión ${id} creada`, 'success');
         }
