@@ -1,3 +1,4 @@
+import { fireWebhook } from './webhooks.js';
 import pkg from 'whatsapp-web.js';
 const { Client, LocalAuth } = pkg;
 import { toDataURL } from 'qrcode';
@@ -69,6 +70,8 @@ export async function createSession(id) {
     session.info = info || null;
     console.log(`[${id}] authenticated`);
     bus.emit('authenticated', { id, info });
+      fireWebhook('authenticated', { id }); // <— NUEVO
+
   });
 
   client.on('ready', async () => {
