@@ -1,4 +1,6 @@
-import { Client, LocalAuth } from 'whatsapp-web.js';
+// ✅ compatible con ESM
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth } = pkg;
 import { toDataURL } from 'qrcode';
 import fs from 'fs';
 import path from 'path';
