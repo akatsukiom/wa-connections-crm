@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Conexiones WhatsApp</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;max-width:920px;margin:24px auto;padding:0 16px}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+    .card{border:1px solid #e3e3e3;border-radius:12px;padding:16px}
+    .row{display:flex;gap:8px;margin:6px 0}
+    img.qr{width:100%;height:auto;border:1px solid #ddd;border-radius:8px}
+    .muted{color:#666;font-size:.9rem}
+    button{padding:8px 12px;border-radius:8px;border:1px solid #ddd;cursor:pointer;background:#fff}
+    input,button{font-size:16px}
+    .ok{color:#0a7d22}
+    .warn{color:#c37a00}
+    .bad{color:#b00020}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Conexiones WhatsApp</h1>
+  <div class="row">
+    <input id="sid" placeholder="ID de sesión (ej: soporte-1)" />
+    <button id="btnCreate">Crear / Conectar</button>
+  </div>
+</header>
+
+<section id="list" class="grid"></section>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+  const list = document.getElementById('list');
+  const socket = io();
+
+  const sessions = new Map();
+
+  function statusColor(s){
+    if(s==='ready') return 'ok';
+    if(s==='qr' || s==='authenticating' || s==='initializing') return 'warn';
+    return 'bad';
+  }
+
+  function renderCard(s){
+    const id = s.id;
+    let box = document.createElement('div'); box.className='card';
+    box.innerHTML = `
+      <h3>${id}</h3>
+      <div class="muted">Estado: <b class="${statusColor(s.status)}">${s.status}</b></div>
+      <div class="muted">Yo: <span class="me">${s.me?.wid || '-'}</span></div>
+      <div class="qrwrap"></div>
+      <div class="row">
+        <input class="to" placeholder="Número (ej: 5215550000000)" />
+      </div>
+      <div class="row">
+        <input class="msg" placeholder="Mensaje a enviar..." />
+        <button class="send">Enviar</button>
+      </div>
+      <div class="row">
+        <button class="join">Escuchar eventos</button>
+        <button class="delete">Eliminar sesión</button>
+      </div>
+    `;
+    const qrwrap = box.querySelector('.qrwrap');
+    const btnSend = box.querySelector('.send');
+    const btnDel = box.querySelector('.delete');
+    const btnJoin= box.querySelector('.join');
+
+    btnSend.onclick = async () => {
+      const to = box.querySelector('.to').value.trim();
+      const text = box.querySelector('.msg').value.trim();
+      if(!to || !text) return alert('Número y mensaje requeridos');
+      const r = await fetch(`/api/sessions/${id}/messages`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ to, text })
+      }).then(r=>r.json());
+      if(!r.ok) alert('Error: '+r.error); else alert('Enviado');
+    };
+
+    btnDel.onclick = async () => {
+      if(!confirm('¿Eliminar sesión y credenciales?')) return;
+      await fetch(`/api/sessions/${id}`,{method:'DELETE'});
+      location.reload();
+    };
+
+    btnJoin.onclick = () => socket.emit('join', id);
+
+    list.appendChild(box);
+    sessions.set(id, { el: box, imgWrap: qrwrap });
+  }
+
+  function setStatus(id, status, me=null){
+    const s = sessions.get(id); if(!s) return;
+    s.el.querySelector('b').className = statusColor(status);
+    s.el.querySelector('b').textContent = status;
+    if(me && me.wid) s.el.querySelector('.me').textContent = me.wid;
+  }
+
+  function setQR(id, dataUrl){
+    const s = sessions.get(id); if(!s) return;
+    s.imgWrap.innerHTML = `<img class="qr" src="${dataUrl}" alt="QR" />`;
+  }
+
+  socket.on('sessions', (arr) => arr.forEach(s => renderCard(s)));
+  socket.on('qr', ({id, qr}) => { if(!sessions.has(id)) renderCard({id, status:'qr'}); setStatus(id, 'qr'); setQR(id, qr); });
+  socket.on('authenticated', ({id}) => setStatus(id, 'authenticating'));
+  socket.on('ready', ({id, me}) => { setStatus(id, 'ready', me); setQR(id, ''); });
+  socket.on('auth_failure', ({id}) => setStatus(id, 'auth_failure'));
+  socket.on('disconnected', ({id}) => setStatus(id, 'disconnected'));
+  socket.on('message', ({id, message}) => console.log('MSG', id, message.from, message.body));
+
+  document.getElementById('btnCreate').onclick = async () => {
+    const id = document.getElementById('sid').value.trim();
+    if(!id) return alert('Escribe un ID de sesión');
+    const r = await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json());
+    if(!sessions.has(id)) renderCard({id, status:r.status||'initializing'});
+  };
+</script>
+</body>
+</html>
