@@ -80,6 +80,7 @@ export async function createSession(id, opts = {}) {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: id, dataPath: SESSIONS_DIR }),
     puppeteer: buildPuppeteerConfig(),
+    // fijar versión web para evitar roturas por cambios de WA Web
     webVersionCache: {
       type: 'remote',
       remotePath:
@@ -113,7 +114,7 @@ export async function createSession(id, opts = {}) {
   client.on('ready', async () => {
     session.status = 'ready';
     try {
-      session.me = await client.getMe();
+      session.me = await client.getMe(); // { wid, pushname }
     } catch (e) {
       session.me = null;
     }
@@ -142,13 +143,13 @@ export async function createSession(id, opts = {}) {
     bus.emit('message', { id, message });
 
     const data = {
-      id,
+      id, // id de la sesión
       from: message.from,
       to: message.to || (session.me?.wid ?? null),
       body: message.body,
       timestamp: message.timestamp ? message.timestamp * 1000 : Date.now(),
-      type: message.type,
-      ack: message.ack ?? null,
+      type: message.type, // chat, image, etc.
+      ack: message.ack ?? null, // 0..3
       id_msg: message.id?._serialized,
       fromMe: !!message.fromMe,
     };
@@ -201,6 +202,7 @@ export async function sendText(id, to, text) {
   if (!chatId) throw new Error('invalid_recipient');
 
   const msg = await s.client.sendMessage(chatId, text);
+  // opcional: webhook de "message_sent"
   fireWebhook('message_sent', {
     id,
     to: chatId,
@@ -225,19 +227,21 @@ export async function reconnect(id) {
 }
 
 /** Restaura todas las sesiones guardadas en disco */
-export function restoreAllSessions() {
-  if (!fs.existsSync(SESSIONS_DIR)) return [];
-  const ids = fs
-    .readdirSync(SESSIONS_DIR)
-    .filter((f) => fs.lstatSync(path.join(SESSIONS_DIR, f)).isDirectory())
-    .map((f) => f.replace(/^session-/, ''));
+export async function restoreAllSessions() {
+  const entries = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true });
+  const ids = [];
 
-  const restored = [];
-  for (const id of ids) {
-    if (!clients.has(id)) {
-      createSession(id);
-      restored.push(id);
+  for (const dir of entries) {
+    if (dir.isDirectory() && dir.name.startsWith('session-')) {
+      const id = dir.name.replace(/^session-/, '');
+      try {
+        await createSession(id); // espera a que se cree cada sesión
+        ids.push(id);
+      } catch (e) {
+        console.error(`[${id}] restore error:`, e.message);
+      }
     }
   }
-  return restored;
+
+  return ids;
 }
