@@ -1,8 +1,10 @@
+// src/server.js
 import express from 'express';
 import cors from 'cors';
 import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
+
 import {
   createSession,
   listSessions,
@@ -10,11 +12,12 @@ import {
   deleteSession,
   sendText,
   restoreAllSessions,
+  revokeMessage,     // ⬅️ NUEVO
 } from './connections.js';
 
 // Server base
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true }));
 app.use(express.json({ limit: '1mb' }));
 
 // Static (panel)
@@ -48,14 +51,34 @@ app.delete('/api/sessions/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// Enviar texto (devuelve id serializado y chatId para guardarlos)
 app.post('/api/sessions/:id/messages', async (req, res) => {
-  const { to, text } = req.body || {};
-  if (!to || !text) return res.status(400).json({ ok: false, error: 'missing_fields' });
   try {
-    const result = await sendText(req.params.id, to, text);
-    res.json({ ok: true, data: result.id._serialized });
+    const { to, text } = req.body || {};
+    if (!to || !text) return res.status(400).json({ ok: false, error: 'missing_fields' });
+
+    const msg = await sendText(req.params.id, to, text);
+    const messageId = msg?.id?._serialized || null;
+    const chatId = msg?.from || `${String(to).replace(/\D/g, '')}@c.us`;
+
+    res.json({ ok: true, id: messageId, chatId });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// ⬇️ NUEVO: “Eliminar para todos”
+app.post('/api/sessions/:id/messages/revoke', async (req, res) => {
+  try {
+    const { chatId, messageId } = req.body || {};
+    if (!chatId || !messageId) {
+      return res.status(400).json({ ok: false, error: 'chatId and messageId required' });
+    }
+    const out = await revokeMessage(req.params.id, chatId, messageId);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    console.error('revoke error', e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
 
@@ -73,7 +96,7 @@ io.on('connection', (socket) => {
     socket.join(sessionId);
   });
 
-  // Emitir a room y también broadcast (por si el cliente no se unió aún)
+  // Emitir a room y también broadcast
   const forward = (ev) => (payload) => {
     const { id } = payload || {};
     if (id) io.to(id).emit(ev, payload);
@@ -89,7 +112,7 @@ restoreAllSessions()
   .then((ids) => console.log('Sesiones restauradas:', ids))
   .catch((e) => console.error('Restore error:', e));
 
-// (Opcional) Precalentar una sesión si defines AUTO_SESSION_ID en variables
+// (Opcional) Precalentar una sesión si defines AUTO_SESSION_ID
 const autoId = process.env.AUTO_SESSION_ID;
 if (autoId) {
   createSession(autoId)
