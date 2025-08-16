@@ -4,18 +4,17 @@ import path from 'path';
 import EventEmitter from 'events';
 import { toDataURL } from 'qrcode';
 
-// whatsapp-web.js es CommonJS → import por default y desestructurar:
+// whatsapp-web.js (CommonJS) importado como default
 import wwebjs from 'whatsapp-web.js';
 const { Client, LocalAuth } = wwebjs;
 
-// Webhooks (opcional, pero recomendado)
 import { fireWebhook } from './webhooks.js';
 
 /* ===========================
    Config & helpers
 =========================== */
 
-export const bus = new EventEmitter(); // emite: qr, authenticated, ready, auth_failure, disconnected, message
+export const bus = new EventEmitter(); // qr, authenticated, ready, auth_failure, disconnected, message
 
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR || path.join(process.cwd(), 'sessions');
@@ -24,16 +23,16 @@ if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Map de sesiones vivas en memoria
+// Sesiones vivas en memoria
 const clients = new Map(); // id -> { client, status, info, me }
 
 /** estado actual (string) o 'offline' si no existe */
 const statusOf = (id) => clients.get(id)?.status || 'offline';
 
-/** arma config de puppeteer compatible con Railway/Docker */
+/** Config de Puppeteer compatible con Railway/Docker */
 function buildPuppeteerConfig() {
   const conf = {
-    headless: true, // en Node 20, "true" funciona bien
+    headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -45,7 +44,6 @@ function buildPuppeteerConfig() {
     ],
   };
 
-  // Si definiste un binario de Chromium en el contenedor
   const exe =
     process.env.CHROMIUM_PATH ||
     process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -65,13 +63,12 @@ function toChatId(raw) {
 }
 
 /* ===========================
-   API
+   API pública
 =========================== */
 
 /**
  * Crea / inicializa una sesión (si ya existe en memoria, la devuelve).
- * - Persistencia con LocalAuth en SESSIONS_DIR.
- * - Emite eventos al bus y dispara webhooks.
+ * Persistencia con LocalAuth en SESSIONS_DIR.
  */
 export async function createSession(id, opts = {}) {
   if (!id) throw new Error('missing_session_id');
@@ -80,7 +77,6 @@ export async function createSession(id, opts = {}) {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: id, dataPath: SESSIONS_DIR }),
     puppeteer: buildPuppeteerConfig(),
-    // fijar versión web para evitar roturas por cambios de WA Web
     webVersionCache: {
       type: 'remote',
       remotePath:
@@ -115,7 +111,7 @@ export async function createSession(id, opts = {}) {
     session.status = 'ready';
     try {
       session.me = await client.getMe(); // { wid, pushname }
-    } catch (e) {
+    } catch {
       session.me = null;
     }
     bus.emit('ready', { id, me: session.me });
@@ -133,9 +129,7 @@ export async function createSession(id, opts = {}) {
     bus.emit('disconnected', { id, reason });
     fireWebhook('disconnected', { id, reason });
 
-    try {
-      client.destroy();
-    } catch {}
+    try { client.destroy(); } catch {}
     clients.delete(id);
   });
 
@@ -148,8 +142,8 @@ export async function createSession(id, opts = {}) {
       to: message.to || (session.me?.wid ?? null),
       body: message.body,
       timestamp: message.timestamp ? message.timestamp * 1000 : Date.now(),
-      type: message.type, // chat, image, etc.
-      ack: message.ack ?? null, // 0..3
+      type: message.type,
+      ack: message.ack ?? null,
       id_msg: message.id?._serialized,
       fromMe: !!message.fromMe,
     };
@@ -175,16 +169,16 @@ export function getSession(id) {
   return clients.get(id) || null;
 }
 
-/** Cierra sesión, la elimina del mapa y borra credenciales en disco */
+/** Alias por claridad en otras partes de la app */
+export const getClient = getSession;
+
+/** Cierra sesión, la elimina y borra credenciales en disco */
 export async function deleteSession(id) {
   const s = clients.get(id);
   if (s) {
-    try {
-      await s.client.destroy();
-    } catch {}
+    try { await s.client.destroy(); } catch {}
     clients.delete(id);
   }
-
   const dir = path.join(SESSIONS_DIR, `session-${id}`);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
 
@@ -202,7 +196,7 @@ export async function sendText(id, to, text) {
   if (!chatId) throw new Error('invalid_recipient');
 
   const msg = await s.client.sendMessage(chatId, text);
-  // opcional: webhook de "message_sent"
+
   fireWebhook('message_sent', {
     id,
     to: chatId,
@@ -210,7 +204,36 @@ export async function sendText(id, to, text) {
     id_msg: msg?.id?._serialized || null,
     timestamp: Date.now(),
   });
-  return msg;
+
+  return msg; // contiene id._serialized
+}
+
+/**
+ * Revocar un mensaje (eliminar para todos)
+ * - sessionId: id de la sesión (ej. 'wp')
+ * - chatId: '521XXXXXXXXXX@c.us'
+ * - messageId: id serializado (msg.id._serialized)
+ */
+export async function revokeMessage(sessionId, chatId, messageId) {
+  const s = clients.get(sessionId);
+  if (!s) throw new Error('session_not_found');
+  if (s.status !== 'ready') throw new Error('session_not_ready');
+
+  const toId = toChatId(chatId);
+  if (!toId) throw new Error('invalid_chat_id');
+  if (!messageId) throw new Error('invalid_message_id');
+
+  // whatsapp-web.js soporta getMessageById y delete(true)
+  if (typeof s.client.getMessageById === 'function') {
+    const msg = await s.client.getMessageById(messageId);
+    if (!msg) throw new Error('message_not_found');
+    await msg.delete(true); // true => eliminar para todos (si WA lo permite por ventana de tiempo)
+    fireWebhook('message_revoked', { id: sessionId, chatId: toId, messageId });
+    return { ok: true, engine: 'whatsapp-web.js' };
+  }
+
+  // En caso de que más adelante uses otro cliente (fallback no-op)
+  throw new Error('revoke_not_supported_by_client');
 }
 
 /** Reconecta (cierra y vuelve a inicializar) sin borrar credenciales */
@@ -218,9 +241,7 @@ export async function reconnect(id) {
   const s = clients.get(id);
   if (!s) throw new Error('session_not_found');
 
-  try {
-    await s.client.destroy();
-  } catch {}
+  try { await s.client.destroy(); } catch {}
   clients.delete(id);
 
   return createSession(id);
@@ -235,7 +256,7 @@ export async function restoreAllSessions() {
     if (dir.isDirectory() && dir.name.startsWith('session-')) {
       const id = dir.name.replace(/^session-/, '');
       try {
-        await createSession(id); // espera a que se cree cada sesión
+        await createSession(id);
         ids.push(id);
       } catch (e) {
         console.error(`[${id}] restore error:`, e.message);
