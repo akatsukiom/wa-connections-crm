@@ -4,9 +4,9 @@ import path from 'path';
 import EventEmitter from 'events';
 import { toDataURL } from 'qrcode';
 
-// whatsapp-web.js es CommonJS
+// whatsapp-web.js (CommonJS)
 import wwebjs from 'whatsapp-web.js';
-const { Client, LocalAuth } = wwebjs;
+const { Client, LocalAuth, MessageMedia } = wwebjs;
 
 import { fireWebhook } from './webhooks.js';
 
@@ -17,6 +17,9 @@ export const bus = new EventEmitter(); // qr, authenticated, ready, auth_failure
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+
+// tamaño máx. (bytes) para adjuntar base64 en webhook de mensajes entrantes
+const WEBHOOK_MEDIA_MAX = Number(process.env.WEBHOOK_MEDIA_MAX || 1500000); // ~1.5 MB
 
 // Sesiones vivas en memoria: id -> { client, status, info, me }
 const clients = new Map();
@@ -50,6 +53,15 @@ function toChatId(raw) {
   if (/@(c\.us|g\.us)$/i.test(s)) return s;
   const digits = s.replace(/\D/g, '');
   return digits ? `${digits}@c.us` : null;
+}
+
+function inferMediaType(mime) {
+  if (!mime) return null;
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'application/pdf') return 'document';
+  return 'document';
 }
 
 /* ===========================
@@ -116,19 +128,52 @@ export async function createSession(id) {
     clients.delete(id);
   });
 
-  client.on('message', (message) => {
-    bus.emit('message', { id, message });
+  client.on('message', async (message) => {
+    // payload base
     const data = {
-      id,                           // sesión
+      id, // sesión
       from: message.from,
       to: message.to || (session.me?.wid ?? null),
       body: message.body,
       timestamp: message.timestamp ? message.timestamp * 1000 : Date.now(),
-      type: message.type,
+      type: message.type, // chat, image, video, audio, etc.
       ack: message.ack ?? null,
       id_msg: message.id?._serialized || null,
       fromMe: !!message.fromMe,
     };
+
+    // si trae media, intentamos descargarla (con límite)
+    try {
+      if (message.hasMedia && typeof message.downloadMedia === 'function') {
+        const media = await message.downloadMedia(); // { data(base64), mimetype, filename }
+        if (media?.data && media?.mimetype) {
+          // calcular bytes estimados de base64
+          const approxBytes = Math.floor(media.data.length * 0.75);
+          if (approxBytes <= WEBHOOK_MEDIA_MAX) {
+            data.media = {
+              mimetype: media.mimetype,
+              filename: media.filename || null,
+              data: media.data, // base64 (solo si <= límite)
+              size: approxBytes,
+              media_type: inferMediaType(media.mimetype),
+            };
+          } else {
+            data.media = {
+              mimetype: media.mimetype,
+              filename: media.filename || null,
+              data: null, // demasiado grande → no adjuntamos
+              size: approxBytes,
+              media_type: inferMediaType(media.mimetype),
+              skipped: true,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[${id}] downloadMedia error:`, e.message);
+    }
+
+    bus.emit('message', { id, message });
     fireWebhook('message', data);
   });
 
@@ -185,6 +230,39 @@ export async function sendText(id, to, text) {
   });
 
   return msg; // contiene id._serialized
+}
+
+/** Enviar media (imágenes, videos, documentos, audio/nota de voz) */
+export async function sendMedia(sessionId, to, buffer, mime, fileName = 'file', opts = {}) {
+  const s = clients.get(sessionId);
+  if (!s) throw new Error('session_not_found');
+  if (s.status !== 'ready') throw new Error('session_not_ready');
+
+  const chatId = toChatId(to);
+  if (!chatId) throw new Error('invalid_recipient');
+  if (!buffer || !mime) throw new Error('invalid_media');
+
+  const media = new MessageMedia(mime, buffer.toString('base64'), fileName);
+
+  const sendOpts = {};
+  // nota de voz (push-to-talk) si se pide
+  if (opts.asVoice) sendOpts.sendAudioAsVoice = true;
+
+  const msg = await s.client.sendMessage(chatId, media, sendOpts);
+
+  const ts = msg?.timestamp ? msg.timestamp * 1000 : Date.now();
+
+  fireWebhook('message_sent', {
+    id: sessionId,
+    to: chatId,
+    id_msg: msg?.id?._serialized || null,
+    timestamp: ts,
+    media_type: inferMediaType(mime),
+    mime,
+    file_name: fileName,
+  });
+
+  return msg;
 }
 
 /** Revocar (eliminar para todos) */
