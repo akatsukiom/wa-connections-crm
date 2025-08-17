@@ -15,6 +15,7 @@ import {
   sendMedia,
   restoreAllSessions,
   revokeMessage,
+  bus, // importamos aquí para enlazar el bridge global una sola vez
 } from './connections.js';
 
 // ---------- Server base ----------
@@ -22,11 +23,14 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '10mb' }));
 
-// Static (panel opcional)
+// Static (panel + uploads)
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
+// Alias explícito a /uploads por claridad (sirve public/uploads)
+app.use('/uploads', express.static(path.join(PUBLIC_DIR, 'uploads')));
+// Resto de estáticos (sirve /public completo)
 app.use(express.static(PUBLIC_DIR));
 
-// Multer en memoria
+// Multer en memoria (para endpoint de envío de media)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
@@ -75,7 +79,6 @@ app.post('/api/sessions/:id/messages', async (req, res) => {
 
     const messageId = msg?.id?._serialized || null;
     const chatId    = msg?.from || `${String(to).replace(/\D/g, '')}@c.us`;
-    // ⬇️ devolvemos el timestamp real del mensaje (ms)
     const timestamp = msg?.timestamp ? msg.timestamp * 1000 : Date.now();
 
     res.json({ ok: true, id: messageId, chatId, timestamp });
@@ -105,7 +108,7 @@ app.post('/api/sessions/:id/media', upload.single('file'), async (req, res) => {
 
     const messageId = out?.id?._serialized || null;
     const chatId    = out?.from || `${String(to).replace(/\D/g, '')}@c.us`;
-    const timestamp = out?.timestamp ? out.timestamp * 1000 : Date.now(); // ⬅️ también aquí
+    const timestamp = out?.timestamp ? out.timestamp * 1000 : Date.now();
 
     res.json({
       ok: true,
@@ -140,19 +143,20 @@ app.post('/api/sessions/:id/messages/revoke', async (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-import { bus } from './connections.js';
+// Bridge global bus -> io (registrado UNA sola vez)
+const forward = (ev) => (payload) => {
+  const { id } = payload || {};
+  if (id) io.to(id).emit(ev, payload);
+  io.emit(ev, payload);
+};
+for (const ev of ['qr', 'authenticated', 'ready', 'auth_failure', 'disconnected', 'message']) {
+  bus.on(ev, forward(ev));
+}
+
+// Por conexión: solo gestionar salas y estado inicial
 io.on('connection', (socket) => {
   socket.emit('sessions', listSessions());
   socket.on('join', (sessionId) => socket.join(sessionId));
-
-  const forward = (ev) => (payload) => {
-    const { id } = payload || {};
-    if (id) io.to(id).emit(ev, payload);
-    io.emit(ev, payload);
-  };
-  for (const ev of ['qr', 'authenticated', 'ready', 'auth_failure', 'disconnected', 'message']) {
-    bus.on(ev, forward(ev));
-  }
 });
 
 // Restaurar sesiones guardadas al arrancar
