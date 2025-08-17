@@ -20,13 +20,13 @@ import {
 // ---------- Server base ----------
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '10mb' })); // un poco más grande por si mandas base64/preview
+app.use(express.json({ limit: '10mb' }));
 
 // Static (panel opcional)
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
 app.use(express.static(PUBLIC_DIR));
 
-// Multer en memoria (no escribe a disco)
+// Multer en memoria
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
@@ -64,7 +64,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ----- Enviar TEXTO (devuelve id serializado y chatId) -----
+// ----- Enviar TEXTO -----
 app.post('/api/sessions/:id/messages', async (req, res) => {
   try {
     const { to, text } = req.body || {};
@@ -72,9 +72,13 @@ app.post('/api/sessions/:id/messages', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'missing_fields' });
     }
     const msg = await sendText(req.params.id, to, text);
+
     const messageId = msg?.id?._serialized || null;
-    const chatId = msg?.from || `${String(to).replace(/\D/g, '')}@c.us`;
-    res.json({ ok: true, id: messageId, chatId });
+    const chatId    = msg?.from || `${String(to).replace(/\D/g, '')}@c.us`;
+    // ⬇️ devolvemos el timestamp real del mensaje (ms)
+    const timestamp = msg?.timestamp ? msg.timestamp * 1000 : Date.now();
+
+    res.json({ ok: true, id: messageId, chatId, timestamp });
   } catch (e) {
     console.error('text error:', e);
     res.status(400).json({ ok: false, error: e.message });
@@ -99,15 +103,19 @@ app.post('/api/sessions/:id/media', upload.single('file'), async (req, res) => {
       { asVoice: !!asVoice, caption: caption || '' }
     );
 
+    const messageId = out?.id?._serialized || null;
+    const chatId    = out?.from || `${String(to).replace(/\D/g, '')}@c.us`;
+    const timestamp = out?.timestamp ? out.timestamp * 1000 : Date.now(); // ⬅️ también aquí
+
     res.json({
       ok: true,
-      id: out?.id?._serialized || null,
-      chatId: out?.from || `${String(to).replace(/\D/g, '')}@c.us`,
+      id: messageId,
+      chatId,
       mime: req.file.mimetype,
       fileName: req.file.originalname || 'file',
+      timestamp,
     });
   } catch (e) {
-    // Si ves “Evaluation failed: b” aquí, el fallback de sendMedia lo cubre reenviando como documento.
     console.error('media error', e);
     res.status(400).json({ ok: false, error: e.message });
   }
@@ -132,7 +140,6 @@ app.post('/api/sessions/:id/messages/revoke', async (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Eventos → sockets
 import { bus } from './connections.js';
 io.on('connection', (socket) => {
   socket.emit('sessions', listSessions());
