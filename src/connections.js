@@ -8,6 +8,7 @@ import { toDataURL } from 'qrcode';
 import wwebjs from 'whatsapp-web.js';
 const { Client, LocalAuth, MessageMedia } = wwebjs;
 
+import mime from 'mime'; // npm i mime
 import { fireWebhook } from './webhooks.js';
 
 /* ===========================
@@ -20,6 +21,12 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 
 // tamaño máx. (bytes) para adjuntar base64 en webhook de mensajes entrantes
 const WEBHOOK_MEDIA_MAX = Number(process.env.WEBHOOK_MEDIA_MAX || 1_500_000); // ~1.5 MB
+
+// URLs de entorno
+const { PUBLIC_BASE_URL, CRM_BASE_URL, CRM_API_TOKEN } = process.env;
+
+// fetch (Node 18+ nativo; fallback si fuese necesario)
+const fetchFn = globalThis.fetch || (async (...args) => (await import('node-fetch')).default(...args));
 
 // Sesiones vivas en memoria: id -> { client, status, info, me }
 const clients = new Map();
@@ -55,18 +62,78 @@ function toChatId(raw) {
   return digits ? `${digits}@c.us` : null;
 }
 
-function inferMediaType(mime) {
-  if (!mime) return null;
-  if (mime.startsWith('image/')) return 'image';
-  if (mime.startsWith('video/')) return 'video';
-  if (mime.startsWith('audio/')) return 'audio';
-  if (mime === 'application/pdf') return 'document';
+function inferMediaType(m) {
+  if (!m) return null;
+  if (m.startsWith('image/')) return 'image';
+  if (m.startsWith('video/')) return 'video';
+  if (m.startsWith('audio/')) return 'audio';
+  if (m === 'application/pdf') return 'document';
   return 'document';
 }
 
 /** ¿es OGG/Opus válido para PTT? */
-function isOggOpus(mime = '') {
-  return /^audio\/ogg(?:;.*)?$/i.test(mime);
+function isOggOpus(mimeStr = '') {
+  return /^audio\/ogg(?:;.*)?$/i.test(mimeStr);
+}
+
+/** extensión segura desde mime */
+function extFromMime(m) {
+  try { return mime.getExtension(m) || 'bin'; } catch { return 'bin'; }
+}
+
+/** guarda base64 en /public/uploads/wa/YYYY/MM y devuelve { url, name, mime, size } */
+function saveBase64ToUploads(base64, mimeType) {
+  const buf = Buffer.from(base64, 'base64');
+  const now = new Date();
+  const yy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dir = path.join('public', 'uploads', 'wa', yy, mm);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const ext = extFromMime(mimeType);
+  const name = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}.${ext}`;
+  const full = path.join(dir, name);
+  fs.writeFileSync(full, buf);
+
+  const url = `${PUBLIC_BASE_URL}/uploads/wa/${yy}/${mm}/${name}`;
+  return { url, name, mime: mimeType, size: buf.length };
+}
+
+/** mapea tipos de whatsapp-web.js a tipos del CRM */
+function mapWwebTypeToCRM(t) {
+  switch (t) {
+    case 'chat': return 'text';
+    case 'image': return 'image';
+    case 'video': return 'video';
+    case 'audio':
+    case 'ptt': return 'audio';
+    case 'document': return 'file';
+    case 'sticker': return 'image'; // webp -> render como imagen
+    default: return 'text';
+  }
+}
+
+/** Post al CRM /api/messages.php (entrantes) */
+async function postIncomingToCRM(payload) {
+  if (!CRM_BASE_URL) {
+    console.warn('[CRM] CRM_BASE_URL no configurado, se omite POST');
+    return;
+  }
+  try {
+    await fetchFn(`${CRM_BASE_URL}/api/messages.php`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(CRM_API_TOKEN ? { 'Authorization': `Bearer ${CRM_API_TOKEN}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    }).then(r => r.text()).then(t => {
+      if (!t || t.startsWith('<')) console.log('[CRM] respuesta (HTML?)', t?.slice(0, 200));
+      else console.log('[CRM] ok', t);
+    });
+  } catch (e) {
+    console.error('[CRM] POST error:', e);
+  }
 }
 
 /* ===========================
@@ -134,7 +201,7 @@ export async function createSession(id) {
   });
 
   client.on('message', async (message) => {
-    // payload base
+    // payload base para tus websockets/webhooks existentes
     const data = {
       id, // sesión
       from: message.from,
@@ -147,37 +214,71 @@ export async function createSession(id) {
       fromMe: !!message.fromMe,
     };
 
-    // si trae media, intentamos descargarla (con límite)
-    try {
-      if (message.hasMedia && typeof message.downloadMedia === 'function') {
-        const media = await message.downloadMedia(); // { data(base64), mimetype, filename }
-        if (media?.data && media?.mimetype) {
-          // bytes estimados de base64
-          const approxBytes = Math.floor(media.data.length * 0.75);
-          if (approxBytes <= WEBHOOK_MEDIA_MAX) {
-            data.media = {
-              mimetype: media.mimetype,
-              filename: media.filename || null,
-              data: media.data, // base64 (solo si <= límite)
-              size: approxBytes,
-              media_type: inferMediaType(media.mimetype),
+    // ===== NUEVO: persistir media y enviar a CRM =====
+    // Solo para ENTRANTES (fromMe === false)
+    if (!message.fromMe) {
+      let mediaInfo = null;
+      try {
+        // caption si aplica
+        const caption = typeof message.caption === 'string' ? message.caption : '';
+        if (caption && (!data.body || data.body === '')) data.body = caption;
+
+        if (message.hasMedia && typeof message.downloadMedia === 'function') {
+          const media = await message.downloadMedia(); // { data(base64), mimetype, filename }
+          if (media?.data && media?.mimetype) {
+            // Guardar SIEMPRE el archivo para poder generar URL pública
+            const saved = saveBase64ToUploads(media.data, media.mimetype);
+            mediaInfo = {
+              media_url: saved.url,
+              media_mime: saved.mime,
+              media_name: media.filename || saved.name,
+              size_bytes: saved.size,
             };
-          } else {
-            data.media = {
-              mimetype: media.mimetype,
-              filename: media.filename || null,
-              data: null, // demasiado grande → no adjuntamos
-              size: approxBytes,
-              media_type: inferMediaType(media.mimetype),
-              skipped: true,
-            };
+
+            // Además, si el archivo es pequeño, adjuntamos base64 al webhook (como ya hacías)
+            const approxBytes = Math.floor(media.data.length * 0.75);
+            if (approxBytes <= WEBHOOK_MEDIA_MAX) {
+              data.media = {
+                mimetype: saved.mime,
+                filename: media.filename || saved.name,
+                data: media.data,
+                size: approxBytes,
+                media_type: inferMediaType(saved.mime),
+              };
+            } else {
+              data.media = {
+                mimetype: saved.mime,
+                filename: media.filename || saved.name,
+                data: null,
+                size: approxBytes,
+                media_type: inferMediaType(saved.mime),
+                skipped: true,
+              };
+            }
           }
         }
+
+        // Construir payload para /api/messages.php
+        const payloadCRM = {
+          channel: 'whatsapp',
+          direction: 'in',
+          chat_id: message.from, // el CRM lo normaliza a E.164
+          wa_message_id: message.id?._serialized || null,
+          body: data.body || '',
+          type: mapWwebTypeToCRM(message.type),
+          created_at_ms: data.timestamp,
+          ...(mediaInfo || {}),
+        };
+
+        await postIncomingToCRM(payloadCRM);
+      } catch (e) {
+        console.warn(`[${id}] persist/CRM error:`, e.message);
       }
-    } catch (e) {
-      console.warn(`[${id}] downloadMedia error:`, e.message);
     }
 
+    // ===== Fin NUEVO =====
+
+    // Mantener tu flujo actual (bus + webhook genérico)
     bus.emit('message', { id, message });
     fireWebhook('message', data);
   });
@@ -238,20 +339,20 @@ export async function sendText(id, to, text) {
 }
 
 /** Enviar media (imágenes, videos, documentos, audio/nota de voz) con fallback */
-export async function sendMedia(sessionId, to, buffer, mime, fileName = 'file', opts = {}) {
+export async function sendMedia(sessionId, to, buffer, mimeType, fileName = 'file', opts = {}) {
   const s = clients.get(sessionId);
   if (!s) throw new Error('session_not_found');
   if (s.status !== 'ready') throw new Error('session_not_ready');
 
   const chatId = toChatId(to);
   if (!chatId) throw new Error('invalid_recipient');
-  if (!buffer || !mime) throw new Error('invalid_media');
+  if (!buffer || !mimeType) throw new Error('invalid_media');
 
   const b64 = Buffer.isBuffer(buffer) ? buffer.toString('base64') : Buffer.from(buffer).toString('base64');
-  const media = new MessageMedia(mime, b64, fileName);
+  const media = new MessageMedia(mimeType, b64, fileName);
 
   // PTT sólo si es OGG/Opus
-  const wantVoice = !!opts.asVoice && isOggOpus(mime);
+  const wantVoice = !!opts.asVoice && isOggOpus(mimeType);
   const baseOptions = {
     caption: opts.caption || '',
     sendAudioAsVoice: wantVoice,
@@ -276,8 +377,8 @@ export async function sendMedia(sessionId, to, buffer, mime, fileName = 'file', 
     to: chatId,
     id_msg: msg?.id?._serialized || null,
     timestamp: ts,
-    media_type: inferMediaType(mime),
-    mime,
+    media_type: inferMediaType(mimeType),
+    mime: mimeType,
     file_name: fileName,
   });
 
