@@ -197,14 +197,14 @@ export async function sendText(id, to, text) {
 
   const msg = await s.client.sendMessage(chatId, text);
 
-  fireWebhook('message_sent', {
-    id,
+   fireWebhook('message_sent', {
+   id,
     to: chatId,
     body: text,
     id_msg: msg?.id?._serialized || null,
-    timestamp: Date.now(),
+   // usa el timestamp real del mensaje de WhatsApp (segundos → ms)
+   timestamp: msg?.timestamp ? msg.timestamp * 1000 : Date.now(),
   });
-
   return msg; // contiene id._serialized
 }
 
