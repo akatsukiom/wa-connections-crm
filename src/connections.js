@@ -4,7 +4,7 @@ import path from 'path';
 import EventEmitter from 'events';
 import { toDataURL } from 'qrcode';
 
-// whatsapp-web.js (CommonJS) importado como default
+// whatsapp-web.js es CommonJS
 import wwebjs from 'whatsapp-web.js';
 const { Client, LocalAuth } = wwebjs;
 
@@ -13,23 +13,15 @@ import { fireWebhook } from './webhooks.js';
 /* ===========================
    Config & helpers
 =========================== */
-
 export const bus = new EventEmitter(); // qr, authenticated, ready, auth_failure, disconnected, message
 
-const SESSIONS_DIR =
-  process.env.SESSIONS_DIR || path.join(process.cwd(), 'sessions');
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), 'sessions');
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-if (!fs.existsSync(SESSIONS_DIR)) {
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-}
-
-// Sesiones vivas en memoria
-const clients = new Map(); // id -> { client, status, info, me }
-
-/** estado actual (string) o 'offline' si no existe */
+// Sesiones vivas en memoria: id -> { client, status, info, me }
+const clients = new Map();
 const statusOf = (id) => clients.get(id)?.status || 'offline';
 
-/** Config de Puppeteer compatible con Railway/Docker */
 function buildPuppeteerConfig() {
   const conf = {
     headless: true,
@@ -43,12 +35,10 @@ function buildPuppeteerConfig() {
       '--disable-features=IsolateOrigins,site-per-process',
     ],
   };
-
   const exe =
     process.env.CHROMIUM_PATH ||
     process.env.PUPPETEER_EXECUTABLE_PATH ||
     process.env.GOOGLE_CHROME_BIN;
-
   if (exe) conf.executablePath = exe;
   return conf;
 }
@@ -59,18 +49,13 @@ function toChatId(raw) {
   const s = String(raw).trim();
   if (/@(c\.us|g\.us)$/i.test(s)) return s;
   const digits = s.replace(/\D/g, '');
-  return `${digits}@c.us`;
+  return digits ? `${digits}@c.us` : null;
 }
 
 /* ===========================
    API pública
 =========================== */
-
-/**
- * Crea / inicializa una sesión (si ya existe en memoria, la devuelve).
- * Persistencia con LocalAuth en SESSIONS_DIR.
- */
-export async function createSession(id, opts = {}) {
+export async function createSession(id) {
   if (!id) throw new Error('missing_session_id');
   if (clients.has(id)) return clients.get(id);
 
@@ -87,8 +72,7 @@ export async function createSession(id, opts = {}) {
   const session = { client, status: 'initializing', info: null, me: null };
   clients.set(id, session);
 
-  /* ===== Eventos de cliente ===== */
-
+  // ===== Eventos =====
   client.on('qr', async (qr) => {
     try {
       const qrDataUrl = await toDataURL(qr);
@@ -128,26 +112,23 @@ export async function createSession(id, opts = {}) {
     session.status = 'disconnected';
     bus.emit('disconnected', { id, reason });
     fireWebhook('disconnected', { id, reason });
-
     try { client.destroy(); } catch {}
     clients.delete(id);
   });
 
   client.on('message', (message) => {
     bus.emit('message', { id, message });
-
     const data = {
-      id, // id de la sesión
+      id,                           // sesión
       from: message.from,
       to: message.to || (session.me?.wid ?? null),
       body: message.body,
       timestamp: message.timestamp ? message.timestamp * 1000 : Date.now(),
       type: message.type,
       ack: message.ack ?? null,
-      id_msg: message.id?._serialized,
+      id_msg: message.id?._serialized || null,
       fromMe: !!message.fromMe,
     };
-
     fireWebhook('message', data);
   });
 
@@ -155,7 +136,7 @@ export async function createSession(id, opts = {}) {
   return session;
 }
 
-/** Lista las sesiones vivas (en memoria) */
+/** Lista las sesiones vivas */
 export function listSessions() {
   return Array.from(clients.keys()).map((id) => ({
     id,
@@ -165,14 +146,10 @@ export function listSessions() {
 }
 
 /** Obtiene la sesión (si existe) */
-export function getSession(id) {
-  return clients.get(id) || null;
-}
-
-/** Alias por claridad en otras partes de la app */
+export function getSession(id) { return clients.get(id) || null; }
 export const getClient = getSession;
 
-/** Cierra sesión, la elimina y borra credenciales en disco */
+/** Cerrar sesión y borrar credenciales en disco */
 export async function deleteSession(id) {
   const s = clients.get(id);
   if (s) {
@@ -181,12 +158,11 @@ export async function deleteSession(id) {
   }
   const dir = path.join(SESSIONS_DIR, `session-${id}`);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-
   fireWebhook('session_deleted', { id });
   return true;
 }
 
-/** Enviar texto por una sesión */
+/** Enviar texto */
 export async function sendText(id, to, text) {
   const s = clients.get(id);
   if (!s) throw new Error('session_not_found');
@@ -197,23 +173,21 @@ export async function sendText(id, to, text) {
 
   const msg = await s.client.sendMessage(chatId, text);
 
-   fireWebhook('message_sent', {
-   id,
+  // usar timestamp real del mensaje de WhatsApp (segundos -> ms)
+  const ts = msg?.timestamp ? msg.timestamp * 1000 : Date.now();
+
+  fireWebhook('message_sent', {
+    id,
     to: chatId,
     body: text,
     id_msg: msg?.id?._serialized || null,
-   // usa el timestamp real del mensaje de WhatsApp (segundos → ms)
-   timestamp: msg?.timestamp ? msg.timestamp * 1000 : Date.now(),
+    timestamp: ts,
   });
+
   return msg; // contiene id._serialized
 }
 
-/**
- * Revocar un mensaje (eliminar para todos)
- * - sessionId: id de la sesión (ej. 'wp')
- * - chatId: '521XXXXXXXXXX@c.us'
- * - messageId: id serializado (msg.id._serialized)
- */
+/** Revocar (eliminar para todos) */
 export async function revokeMessage(sessionId, chatId, messageId) {
   const s = clients.get(sessionId);
   if (!s) throw new Error('session_not_found');
@@ -223,35 +197,29 @@ export async function revokeMessage(sessionId, chatId, messageId) {
   if (!toId) throw new Error('invalid_chat_id');
   if (!messageId) throw new Error('invalid_message_id');
 
-  // whatsapp-web.js soporta getMessageById y delete(true)
   if (typeof s.client.getMessageById === 'function') {
     const msg = await s.client.getMessageById(messageId);
     if (!msg) throw new Error('message_not_found');
-    await msg.delete(true); // true => eliminar para todos (si WA lo permite por ventana de tiempo)
+    await msg.delete(true); // true => borrar para todos (si WA lo permite)
     fireWebhook('message_revoked', { id: sessionId, chatId: toId, messageId });
     return { ok: true, engine: 'whatsapp-web.js' };
   }
-
-  // En caso de que más adelante uses otro cliente (fallback no-op)
   throw new Error('revoke_not_supported_by_client');
 }
 
-/** Reconecta (cierra y vuelve a inicializar) sin borrar credenciales */
+/** Reconectar sin borrar credenciales */
 export async function reconnect(id) {
   const s = clients.get(id);
   if (!s) throw new Error('session_not_found');
-
   try { await s.client.destroy(); } catch {}
   clients.delete(id);
-
   return createSession(id);
 }
 
-/** Restaura todas las sesiones guardadas en disco */
+/** Restaurar todas las sesiones guardadas en disco */
 export async function restoreAllSessions() {
   const entries = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true });
   const ids = [];
-
   for (const dir of entries) {
     if (dir.isDirectory() && dir.name.startsWith('session-')) {
       const id = dir.name.replace(/^session-/, '');
@@ -263,6 +231,5 @@ export async function restoreAllSessions() {
       }
     }
   }
-
   return ids;
 }
