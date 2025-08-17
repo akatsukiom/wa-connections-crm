@@ -4,6 +4,7 @@ import cors from 'cors';
 import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
+import multer from 'multer';
 
 import {
   createSession,
@@ -11,21 +12,30 @@ import {
   getSession,
   deleteSession,
   sendText,
+  sendMedia,       // ⬅️ NUEVO
   restoreAllSessions,
-  revokeMessage,     // ⬅️ NUEVO
+  revokeMessage,
 } from './connections.js';
 
-// Server base
+// ---------- Server base ----------
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' })); // un poco más grande por si mandas base64/preview
 
-// Static (panel)
+// Static (panel opcional)
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
 app.use(express.static(PUBLIC_DIR));
 
-// REST API
-app.get('/api/sessions', (req, res) => {
+// Multer para subir archivos en memoria
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+});
+
+// ---------- REST API ----------
+app.get('/api/health', (_req, res) => res.json({ ok: true, name: 'wa-connections', ts: Date.now() }));
+
+app.get('/api/sessions', (_req, res) => {
   res.json({ ok: true, data: listSessions() });
 });
 
@@ -51,7 +61,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Enviar texto (devuelve id serializado y chatId para guardarlos)
+// ----- Enviar texto (devuelve id serializado y chatId) -----
 app.post('/api/sessions/:id/messages', async (req, res) => {
   try {
     const { to, text } = req.body || {};
@@ -67,7 +77,36 @@ app.post('/api/sessions/:id/messages', async (req, res) => {
   }
 });
 
-// ⬇️ NUEVO: “Eliminar para todos”
+// ----- Enviar MEDIA (imágenes / video / docs / audio / nota de voz) -----
+app.post('/api/sessions/:id/media', upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { to, asVoice } = req.body || {};
+    if (!to || !req.file) return res.status(400).json({ ok: false, error: 'missing_to_or_file' });
+
+    const out = await sendMedia(
+      id,
+      to,
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname || 'file',
+      { asVoice: !!asVoice }
+    );
+
+    res.json({
+      ok: true,
+      id: out?.id?._serialized || null,
+      chatId: out?.from || `${String(to).replace(/\D/g, '')}@c.us`,
+      mime: req.file.mimetype,
+      fileName: req.file.originalname || 'file',
+    });
+  } catch (e) {
+    console.error('media error', e);
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// ----- “Eliminar para todos” (revoke) -----
 app.post('/api/sessions/:id/messages/revoke', async (req, res) => {
   try {
     const { chatId, messageId } = req.body || {};
@@ -82,21 +121,16 @@ app.post('/api/sessions/:id/messages/revoke', async (req, res) => {
   }
 });
 
-// HTTP + Socket.io
+// ---------- HTTP + Socket.io ----------
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 // Enlazar bus de eventos a sockets
 import { bus } from './connections.js';
 io.on('connection', (socket) => {
-  // enviar sesiones existentes al conectar
   socket.emit('sessions', listSessions());
+  socket.on('join', (sessionId) => socket.join(sessionId));
 
-  socket.on('join', (sessionId) => {
-    socket.join(sessionId);
-  });
-
-  // Emitir a room y también broadcast
   const forward = (ev) => (payload) => {
     const { id } = payload || {};
     if (id) io.to(id).emit(ev, payload);
@@ -112,7 +146,7 @@ restoreAllSessions()
   .then((ids) => console.log('Sesiones restauradas:', ids))
   .catch((e) => console.error('Restore error:', e));
 
-// (Opcional) Precalentar una sesión si defines AUTO_SESSION_ID
+// (Opcional) Precalentar sesión
 const autoId = process.env.AUTO_SESSION_ID;
 if (autoId) {
   createSession(autoId)
