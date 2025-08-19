@@ -346,28 +346,49 @@ export async function sendMedia(sessionId, to, buffer, mimeType, fileName = 'fil
 
   const chatId = toChatId(to);
   if (!chatId) throw new Error('invalid_recipient');
-  if (!buffer || !mimeType) throw new Error('invalid_media');
+  if (!buffer) throw new Error('invalid_media');
+
+  // 🔧 Normaliza MIME si viene vacío / octet-stream
+  let mm = mimeType || '';
+  if (!mm || mm === 'application/octet-stream') {
+    try { mm = mime.getType(fileName) || mm; } catch {}
+  }
+  if (!mm) mm = 'application/octet-stream';
 
   const b64 = Buffer.isBuffer(buffer) ? buffer.toString('base64') : Buffer.from(buffer).toString('base64');
-  const media = new MessageMedia(mimeType, b64, fileName);
+  const media = new MessageMedia(mm, b64, fileName);
+
+  const isVideo = mm.startsWith('video/');
+  const isImage = mm.startsWith('image/');
+  const isAudio = mm.startsWith('audio/');
 
   // PTT sólo si es OGG/Opus
-  const wantVoice = !!opts.asVoice && isOggOpus(mimeType);
-  const baseOptions = {
-    caption: opts.caption || '',
-    sendAudioAsVoice: wantVoice,
-  };
+  const wantVoice = !!opts.asVoice && isOggOpus(mm);
+  const baseOptions = { caption: opts.caption || '', sendAudioAsVoice: wantVoice };
 
   let msg;
   try {
-    msg = await s.client.sendMessage(chatId, media, baseOptions);
+    // 👇 Fuerza ruta correcta por tipo
+    if (isVideo) {
+      // VIDEO con preview (clave para que el receptor vea miniatura)
+      msg = await s.client.sendMessage(chatId, media, { ...baseOptions, sendVideoAsDocument: false });
+    } else if (isImage || isAudio) {
+      msg = await s.client.sendMessage(chatId, media, baseOptions);
+    } else {
+      // otros tipos
+      msg = await s.client.sendMessage(chatId, media, baseOptions);
+    }
   } catch (e) {
-    // Fallback: reintenta como DOCUMENTO (evita “Evaluation failed: b”)
-    const shouldFallback = /Evaluation failed/i.test(e.message) || /not a function/i.test(e.message);
-    if (!shouldFallback) throw e;
+    // 👇 Solo caer a DOCUMENTO si NO es video (para video queremos preview)
+    const shouldFallback = /Evaluation failed|not a function/i.test(e.message || '');
+    if (!shouldFallback || isVideo) throw e;
 
-    const fallbackOptions = { ...baseOptions, sendAudioAsVoice: false, sendMediaAsDocument: true };
-    msg = await s.client.sendMessage(chatId, media, fallbackOptions);
+    // documento para tipos “raros”
+    msg = await s.client.sendMessage(chatId, media, {
+      ...baseOptions,
+      sendAudioAsVoice: false,
+      sendMediaAsDocument: true,
+    });
   }
 
   const ts = msg?.timestamp ? msg.timestamp * 1000 : Date.now();
@@ -377,8 +398,8 @@ export async function sendMedia(sessionId, to, buffer, mimeType, fileName = 'fil
     to: chatId,
     id_msg: msg?.id?._serialized || null,
     timestamp: ts,
-    media_type: inferMediaType(mimeType),
-    mime: mimeType,
+    media_type: inferMediaType(mm),
+    mime: mm,
     file_name: fileName,
   });
 
