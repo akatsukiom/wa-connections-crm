@@ -95,7 +95,8 @@ function saveBase64ToUploads(base64, mimeType) {
   const full = path.join(dir, name);
   fs.writeFileSync(full, buf);
 
-  const url = `${PUBLIC_BASE_URL}/uploads/wa/${yy}/${mm}/${name}`;
+  const baseUrl = PUBLIC_BASE_URL || '';
+  const url = `${baseUrl}/uploads/wa/${yy}/${mm}/${name}`;
   return { url, name, mime: mimeType, size: buf.length };
 }
 
@@ -113,24 +114,24 @@ function mapWwebTypeToCRM(t) {
   }
 }
 
-/** Post al CRM /api/messages.php (entrantes) */
+/** Post al CRM (entrantes) -> usar webhook PHP que inserta media */
 async function postIncomingToCRM(payload) {
   if (!CRM_BASE_URL) {
     console.warn('[CRM] CRM_BASE_URL no configurado, se omite POST');
     return;
   }
   try {
-    await fetchFn(`${CRM_BASE_URL}/api/messages.php`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(CRM_API_TOKEN ? { 'Authorization': `Bearer ${CRM_API_TOKEN}` } : {}),
-      },
-      body: JSON.stringify(payload),
-    }).then(r => r.text()).then(t => {
-      if (!t || t.startsWith('<')) console.log('[CRM] respuesta (HTML?)', t?.slice(0, 200));
-      else console.log('[CRM] ok', t);
-    });
+    const url = `${CRM_BASE_URL}/api/whatsapp_webhook.php`; // <-- corregido
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(CRM_API_TOKEN ? { 'Authorization': `Bearer ${CRM_API_TOKEN}` } : {}),
+    };
+    await fetchFn(url, { method: 'POST', headers, body: JSON.stringify(payload) })
+      .then(r => r.text())
+      .then(t => {
+        if (!t || t.startsWith('<')) console.log('[CRM] respuesta (HTML?)', t?.slice(0, 200));
+        else console.log('[CRM] ok', t);
+      });
   } catch (e) {
     console.error('[CRM] POST error:', e);
   }
@@ -201,7 +202,7 @@ export async function createSession(id) {
   });
 
   client.on('message', async (message) => {
-    // payload base para tus websockets/webhooks existentes
+    // payload base para tus websockets/webhooks actuales
     const data = {
       id, // sesión
       from: message.from,
@@ -214,8 +215,7 @@ export async function createSession(id) {
       fromMe: !!message.fromMe,
     };
 
-    // ===== NUEVO: persistir media y enviar a CRM =====
-    // Solo para ENTRANTES (fromMe === false)
+    // ===== Persistir media y enviar al CRM sólo para ENTRANTES =====
     if (!message.fromMe) {
       let mediaInfo = null;
       try {
@@ -226,7 +226,7 @@ export async function createSession(id) {
         if (message.hasMedia && typeof message.downloadMedia === 'function') {
           const media = await message.downloadMedia(); // { data(base64), mimetype, filename }
           if (media?.data && media?.mimetype) {
-            // Guardar SIEMPRE el archivo para poder generar URL pública
+            // Guardar SIEMPRE el archivo para tener URL pública
             const saved = saveBase64ToUploads(media.data, media.mimetype);
             mediaInfo = {
               media_url: saved.url,
@@ -235,7 +235,7 @@ export async function createSession(id) {
               size_bytes: saved.size,
             };
 
-            // Además, si el archivo es pequeño, adjuntamos base64 al webhook (como ya hacías)
+            // Adjuntar base64 si es chico
             const approxBytes = Math.floor(media.data.length * 0.75);
             if (approxBytes <= WEBHOOK_MEDIA_MAX) {
               data.media = {
@@ -258,7 +258,7 @@ export async function createSession(id) {
           }
         }
 
-        // Construir payload para /api/messages.php
+        // Payload para webhook PHP
         const payloadCRM = {
           channel: 'whatsapp',
           direction: 'in',
@@ -275,8 +275,7 @@ export async function createSession(id) {
         console.warn(`[${id}] persist/CRM error:`, e.message);
       }
     }
-
-    // ===== Fin NUEVO =====
+    // ===== Fin persistencia =====
 
     // Mantener tu flujo actual (bus + webhook genérico)
     bus.emit('message', { id, message });
